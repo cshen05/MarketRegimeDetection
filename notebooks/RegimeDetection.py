@@ -17,7 +17,9 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 import warnings
+
 import joblib
+from joblib import Parallel, delayed
 
 
 warnings.filterwarnings('ignore')
@@ -27,6 +29,7 @@ warnings.filterwarnings('ignore')
 # - We cache only expensive, deterministic steps (data filters, features, matrices, models)
 # - Cache keys include key parameters so caches invalidate when logic/inputs change
 
+# CACHING HELPERS
 import os, json, hashlib
 from pathlib import Path
 
@@ -52,6 +55,11 @@ def save_parquet_df(df: pd.DataFrame, path: Path):
 
 def load_parquet_df(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path, engine="pyarrow")
+
+# fingerprint of the exact feature matrix used (shape + bytes)
+def _x_fingerprint(X: np.ndarray) -> str:
+    arr = np.ascontiguousarray(X).view(np.uint8)
+    return hashlib.blake2b(arr, digest_size=12).hexdigest()
 
 print(f"[cache] directory => {CACHE_DIR}")
 
@@ -111,7 +119,7 @@ else:
 summary = summary.set_index("Ticker") if "Ticker" in summary.columns else summary
 
 # %%
-df_top100 = df_top100.reset_index(drop=True)
+df_top100 = df_top100.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 df_top100
 
 # %% [markdown]
@@ -177,9 +185,13 @@ features_to_use = [
     "bb_percent", "price_to_sma", "co_ratio", "volume_z"
 ]
 
+# Stronger cache key: all tickers (sorted) hashed, not just first 10
+_tickers_all = sorted(df_top100["Ticker"].unique().tolist())
+_tickers_hash = hashlib.blake2b("|".join(_tickers_all).encode(), digest_size=12).hexdigest()
+
 _feat_key = _hash_key({
     "features": features_to_use,
-    "tickers": sorted(df_top100["Ticker"].unique().tolist())[:10],  # partial key sample for stability
+    "tickers_hash": _tickers_hash,
 })
 
 features_cache_path = cache_path("df_features", _feat_key, ext="parquet")
@@ -218,56 +230,80 @@ else:
 scaled_cols = [f"{col}_scaled" for col in features_to_use]
 
 # %%
-# Define parameter search space
+# Define parameter search space (CACHED)
 n_obs, n_features = X.shape
 n_components_range = range(1, 7)  # Number of regimes to test
 covariance_types = ['full', 'diag']  # Covariance matrix types
 tolerances = [1e-2, 1e-4, 1e-6]  # Convergence tolerances
 
-results = []
+# Build a cache key tied to the *exact* X and the search space
+_grid_key = _hash_key({
+    "model": "GaussianHMM",
+    "X_shape": tuple(X.shape),
+    "X_hash": _x_fingerprint(X),
+    "n_components": list(n_components_range),
+    "cov_types": covariance_types,
+    "tolerances": tolerances,
+    "random_state": 42,
+    "n_iter": 1000,
+})
 
-for n_components, cov_type, tol in product(n_components_range, covariance_types, tolerances):
-    try:
-        model = GaussianHMM(
-            n_components=n_components,
-            covariance_type=cov_type,
-            tol=tol,
-            n_iter=1000,
-            random_state=42
-        )
-        model.fit(X)
-        logL = model.score(X)
+grid_cache_path = cache_path("ghmm_grid", _grid_key, ext="parquet")
+best_cache_path = cache_path("ghmm_best", _grid_key, ext="pkl")
 
-        # Estimate number of parameters
-        k = n_components * (n_components - 1)  # transition probs
-        k += n_components - 1                 # initial probs
-        k += n_components * n_features * 2    # means and variances
+if grid_cache_path.exists() and best_cache_path.exists():
+    df_results = load_parquet_df(grid_cache_path)
+    best_model = load_pkl(best_cache_path)
+    print(f"[cache] loaded GaussianHMM grid => {grid_cache_path.name}")
+else:
+    results = []
+    for n_components, cov_type, tol in product(n_components_range, covariance_types, tolerances):
+        try:
+            model = GaussianHMM(
+                n_components=n_components,
+                covariance_type=cov_type,
+                tol=tol,
+                n_iter=1000,
+                random_state=42
+            )
+            model.fit(X)
+            logL = model.score(X)
 
-        bic = -2 * logL + k * np.log(n_obs)
-        aic = -2 * logL + 2 * k
+            # Estimate number of parameters (rough)
+            k = n_components * (n_components - 1)  # transition probs
+            k += n_components - 1                 # initial probs
+            k += n_components * n_features * 2    # means and variances
 
-        results.append({
-            'n_components': n_components,
-            'cov_type': cov_type,
-            'tol': tol,
-            'log_likelihood': logL,
-            'AIC': aic,
-            'BIC': bic
-        })
-    except Exception as e:
-        results.append({
-            'n_components': n_components,
-            'cov_type': cov_type,
-            'tol': tol,
-            'log_likelihood': None,
-            'AIC': np.inf,
-            'BIC': np.inf,
-            'error': str(e)
-        })
+            bic = -2 * logL + k * np.log(n_obs)
+            aic = -2 * logL + 2 * k
 
-# Convert to DataFrame and find best config
-df_results = pd.DataFrame(results)
-best_model = df_results.loc[df_results['BIC'].idxmin()]
+            results.append({
+                'n_components': n_components,
+                'cov_type': cov_type,
+                'tol': tol,
+                'log_likelihood': logL,
+                'AIC': aic,
+                'BIC': bic
+            })
+        except Exception as e:
+            results.append({
+                'n_components': n_components,
+                'cov_type': cov_type,
+                'tol': tol,
+                'log_likelihood': None,
+                'AIC': np.inf,
+                'BIC': np.inf,
+                'error': str(e)
+            })
+
+    df_results = pd.DataFrame(results)
+    best_model = df_results.loc[df_results['BIC'].idxmin()]
+
+    # Persist grid + best row
+    save_parquet_df(df_results, grid_cache_path)
+    save_pkl(best_model, best_cache_path)
+    print(f"[cache] saved GaussianHMM grid => {grid_cache_path.name}")
+
 print("Best Config (Based on BIC):")
 print(best_model[["n_components", "cov_type", "tol", "BIC"]])
 
@@ -300,10 +336,14 @@ _best_key = _hash_key({
     "tol": float(best_model['tol'])
 })
 
+# Flag: did we load the Gaussian model from cache?
+gauss_model_loaded_from_cache = False
+
 gauss_model_path = cache_path("gaussian_hmm", _best_key, ext="pkl")
 
 if gauss_model_path.exists():
     gaussian_model = load_pkl(gauss_model_path)
+    gauss_model_loaded_from_cache = True
     print(f"[cache] loaded GaussianHMM => {gauss_model_path.name}")
 else:
     gaussian_model = GaussianHMM(
@@ -403,7 +443,7 @@ def hmm_assumption_diagnostics(df_regime, features, regime_col="regime", date_co
 
     results_df = pd.DataFrame(results)
 
-    # Mark assumptions (Pass if p > 0.05)
+    # Mark assumptions: Stationary? uses ADF (p < 0.05 = reject unit root), Normal?/Independent? use p > 0.05
     results_df["Stationary?"] = results_df["ADF_p (Stationarity)"] < 0.05
     results_df["Normal?"] = results_df["Shapiro_p (Normality)"] > 0.05
     results_df["Independent?"] = results_df["LjungBox_p (Independence)"] > 0.05
@@ -414,16 +454,17 @@ def hmm_assumption_diagnostics(df_regime, features, regime_col="regime", date_co
 scaled_cols
 
 # %%
-diagnostic_results = hmm_assumption_diagnostics(
-    df_regime,
-    features= scaled_cols,
-    regime_col="regime",
-    date_col="Date",
-    plot=True 
-)
-
-# %%
-diagnostic_results
+if not gauss_model_loaded_from_cache:
+    diagnostic_results = hmm_assumption_diagnostics(
+        df_regime,
+        features=scaled_cols,
+        regime_col="regime",
+        date_col="Date",
+        plot=True
+    )
+    diagnostic_results
+else:
+    print("[skip] Gaussian model loaded from cache — skipping assumption diagnostics.")
 
 # %% [markdown]
 # Main takeaways: stationarity passes, normality and independence fail
@@ -596,7 +637,7 @@ if "regime_gmm" not in df_regime.columns:
     df_regime["regime_gmm"] = regimes_gmm
 
 # %% [markdown]
-# GMMHMM model converges at the 794 iteration with tolerance set at 0.01. 
+#  
 
 # %%
 df_regime
@@ -638,11 +679,12 @@ def compare_hmm_models(df, price_col="Close",
     bic_gmm = np.log(len(df)) * k_gmm - 2*ll_gmm
 
     # Calculate returns
-    df["return"] = df[price_col].pct_change().fillna(0)
+    temp_df = df.copy()
+    temp_df["return"] = temp_df.groupby("Ticker")[price_col].pct_change().fillna(0)
 
     # Sharpe ratio & mean returns for each regime
     def regime_metrics(states, label):
-        temp = df.copy()
+        temp = temp_df.copy()
         temp["regime"] = states
         metrics = []
         for state in np.unique(states):
@@ -720,7 +762,12 @@ print(metrics["RegimeMetrics"])
 def regime_stats(df, regimes, price_col="Close"):
     temp = df.copy()
     temp["regime"] = regimes
-    temp["ret"] = temp[price_col].pct_change().fillna(0.0)
+    # compute returns within each ticker to avoid cross-ticker jumps
+    temp["ret"] = (
+        temp.groupby("Ticker")[price_col]
+            .pct_change()
+            .fillna(0.0)
+    )
 
     rows = []
     for s in np.unique(regimes):
@@ -731,47 +778,156 @@ def regime_stats(df, regimes, price_col="Close"):
         rows.append({"regime": int(s), "mean": mean, "std": std, "sharpe": sharpe, "count": len(r)})
     return pd.DataFrame(rows).sort_values("sharpe", ascending=False)
 
-
 # %%
 # ---------- 2) Pick tradeable regimes ----------
-def select_trade_regimes(stats_df, top_k=2, sharpe_min=None):
+def select_trade_regimes(stats_df, top_k=2, sharpe_min=None, min_count=500):
     ranked = stats_df.sort_values("sharpe", ascending=False)
     if sharpe_min is not None:
         ranked = ranked[ranked["sharpe"] >= sharpe_min]
+    if min_count is not None:
+        ranked = ranked[ranked["count"] >= min_count]
     if top_k is not None:
         ranked = ranked.head(top_k)
     return ranked["regime"].tolist(), ranked
 
+# ---------- pick a flat (no-trade) regime: minimal volatility & near-zero mean ----------
+def choose_flat_regime(stats_df: pd.DataFrame, exclude: list[int] | None = None) -> int | None:
+    """Choose flat regime as the one with **smallest abs(mean)** and **small std**, excluding trade regimes."""
+    ex = set(exclude or [])
+    cand = stats_df[~stats_df["regime"].isin(ex)].copy()
+    if cand.empty:
+        return None
+    cand["abs_mean"] = cand["mean"].abs()
+    cand = cand.sort_values(["abs_mean", "std"], ascending=[True, True])
+    return int(cand.iloc[0]["regime"]) if not cand.empty else None
+
+# ---------- pick short (bad) regimes: lowest Sharpe, excluding trade/flat ----------
+def choose_short_regimes(stats_df: pd.DataFrame, exclude: list[int] | None = None, k: int = 1) -> list[int]:
+    ex = set(exclude or [])
+    cand = stats_df[~stats_df["regime"].isin(ex)].copy()
+    if cand.empty:
+        return []
+    cand = cand.sort_values("sharpe", ascending=True)
+    return [int(x) for x in cand["regime"].head(k).tolist()]
+
+# ---------- select 3 stable tradeable regimes with diversity & min_count ----------
+def select_trade_regimes_stable(
+    stats_df: pd.DataFrame,
+    top_k: int = 3,
+    sharpe_min: float | None = 0.5,
+    min_count: int | None = 500,
+    diversity_eps: float = 0.0005,
+):
+    """
+    Pick up to `top_k` regimes by Sharpe, enforcing:
+      - `min_count` samples per regime for stability (if set),
+      - a **diversity** constraint in (mean, std) space to avoid near-duplicates.
+    Falls back by relaxing thresholds to ensure exactly `top_k` are returned when possible.
+    """
+    ranked = stats_df.sort_values("sharpe", ascending=False).copy()
+
+    def _filter(df, sharpe_cut, cnt_cut):
+        out = df
+        if sharpe_cut is not None:
+            out = out[out["sharpe"] >= sharpe_cut]
+        if cnt_cut is not None:
+            out = out[out["count"] >= cnt_cut]
+        return out
+
+    # step 1: strict
+    cand = _filter(ranked, sharpe_min, min_count)
+    # step 2: relax count if needed
+    if len(cand) < top_k:
+        cand = _filter(ranked, sharpe_min, None)
+    # step 3: relax sharpe if still short
+    if len(cand) < top_k:
+        cand = _filter(ranked, None, None)
+
+    # diversity selection
+    picked = []
+    for _, row in cand.iterrows():
+        if len(picked) >= top_k:
+            break
+        if not picked:
+            picked.append(int(row["regime"]))
+            continue
+        # distance in (mean, std)
+        ok = True
+        for r in picked:
+            base = stats_df[stats_df["regime"] == r].iloc[0]
+            dist = np.sqrt((row["mean"] - base["mean"])**2 + (row["std"] - base["std"])**2)
+            if dist < diversity_eps:
+                ok = False
+                break
+        if ok:
+            picked.append(int(row["regime"]))
+
+    # if we still have < top_k, fill from remaining by Sharpe regardless of diversity
+    if len(picked) < top_k:
+        remaining = [int(x) for x in ranked["regime"].tolist() if x not in picked]
+        need = top_k - len(picked)
+        picked += remaining[:need]
+
+    chosen = ranked[ranked["regime"].isin(picked)]
+    return picked, chosen
+
+# helper to pick a single ticker while keeping arrays aligned (must be defined before first use)
+def slice_ticker(df, X, regimes, ticker_col, ticker):
+    mask = (df[ticker_col] == ticker).values
+    df_s = df.loc[mask].copy()
+    X_s = X[mask] if isinstance(X, np.ndarray) else X.loc[mask].values
+    r_s = regimes[mask] if isinstance(regimes, np.ndarray) else np.asarray(regimes)[mask]
+    return df_s, X_s, r_s
+
 # %%
-# ---------- 3) Backtest: long when regime in trade_regimes and confidence ≥ min_prob ----------
+# ---------- 3) Backtest: long/short with optional sizing by confidence ----------
 def backtest_regime_filter(df, price_col, regimes, model, X, trade_regimes,
-                           min_prob=0.0, tc_bps=1.0):
+                           min_prob=0.0, tc_bps=1.0, date_col="Date",
+                           flat_regimes: list[int] | None = None,
+                           allow_short: bool = False,
+                           short_regimes: list[int] | None = None,
+                           size_by_prob: bool = False):
     """
     min_prob: require max posterior prob ≥ min_prob (e.g., 0.6) to take a position
     tc_bps: round-trip transaction cost in basis points deducted on position flips
+    allow_short: if True, allow shorting in specified short_regimes
+    short_regimes: list of regime ints to short (position -1)
+    size_by_prob: if True, scale position size by posterior probability (confidence)
     """
     temp = df.copy()
+    if date_col in temp.columns:
+        temp = temp.set_index(date_col)
     temp["ret"] = temp[price_col].pct_change().fillna(0.0)
 
     # Posterior probabilities (confidence)
     post = model.predict_proba(X)         # shape: (n_samples, n_states)
     max_prob = post.max(axis=1)
 
-    # Position: 1 when regime in trade set AND confidence high, else 0 (flat)
-    pos_raw = np.where((np.isin(regimes, trade_regimes)) & (max_prob >= min_prob), 1.0, 0.0)
+    # Build position: +1 for trade regimes (excluding flat), -1 for short regimes (optional)
+    flat_regimes = flat_regimes or []
+    short_regimes = short_regimes or []
+    reg = np.asarray(regimes)
+    long_mask  = np.isin(reg, trade_regimes) & (~np.isin(reg, np.array(flat_regimes))) & (max_prob >= min_prob)
+    short_mask = np.isin(reg, np.array(short_regimes)) & (max_prob >= min_prob) if allow_short and len(short_regimes) else np.zeros_like(long_mask, dtype=bool)
+
+    pos_raw = np.zeros_like(max_prob, dtype=float)
+    pos_raw[long_mask]  = 1.0
+    pos_raw[short_mask] = -1.0
+
+    if size_by_prob:
+        pos_raw = pos_raw * max_prob
+
     temp["position"] = pd.Series(pos_raw, index=temp.index)
 
     # One-bar delay to avoid look-ahead
     temp["position_shift"] = temp["position"].shift(1).fillna(0.0)
 
-    # Transaction cost when position flips (enter/exit)
-    flips = temp["position_shift"].diff().abs().fillna(0.0)
-    tc = (tc_bps / 10000.0) * flips
+    # Transaction costs proportional to change in executed position (supports sized/short)
+    delta_pos = temp["position_shift"].diff().abs().fillna(temp["position_shift"].abs())
+    tc = (tc_bps / 10000.0) * delta_pos
 
     # Strategy return
     temp["strat_ret"] = temp["position_shift"] * temp["ret"] - tc
-
-    # Cumulative curves
     temp["cum_strat"] = (1.0 + temp["strat_ret"]).cumprod()
     temp["cum_bh"]    = (1.0 + temp["ret"]).cumprod()
 
@@ -780,13 +936,15 @@ def backtest_regime_filter(df, price_col, regimes, model, X, trade_regimes,
         mean = r.mean() * 252
         vol  = r.std() * np.sqrt(252)
         sharpe = mean / vol if vol > 0 else 0.0
-        dd = (temp["cum_strat"].cummax() - temp["cum_strat"]).max()
+        dd = float((temp["cum_strat"].cummax() - temp["cum_strat"]).max())
         return mean, vol, sharpe, dd
 
     ann_mean, ann_vol, ann_sharpe, max_dd = annualized_stats(temp["strat_ret"])
 
     perf = {
         "trade_regimes": trade_regimes,
+        "short_regimes": short_regimes if allow_short else [],
+        "size_by_prob": size_by_prob,
         "min_prob": min_prob,
         "tc_bps": tc_bps,
         "final_cum_strategy": float(temp["cum_strat"].iloc[-1]),
@@ -800,7 +958,7 @@ def backtest_regime_filter(df, price_col, regimes, model, X, trade_regimes,
     # Plot
     plt.figure(figsize=(11,5))
     plt.plot(temp.index, temp["cum_bh"], label="Buy & Hold", linestyle="--")
-    plt.plot(temp.index, temp["cum_strat"], label="Regime Filter (long only)")
+    plt.plot(temp.index, temp["cum_strat"], label="Regime Filter (long/short)")
     plt.title("Cumulative Returns: Regime Filter vs Buy & Hold")
     plt.legend(); plt.grid(True); plt.tight_layout(); plt.show()
 
@@ -811,21 +969,47 @@ def backtest_regime_filter(df, price_col, regimes, model, X, trade_regimes,
 gmm_stats = regime_stats(df_regime, regimes_gmm, price_col="Close")
 print("GMMHMM regime stats (sorted by Sharpe):\n", gmm_stats, "\n")
 
-# 4b) Choose tradeable regimes (example: top 2 by Sharpe, require Sharpe ≥ 0.5)
-trade_regimes, chosen = select_trade_regimes(gmm_stats, top_k=2, sharpe_min=0.5)
-print("Chosen regimes:", trade_regimes)
+# 4b) Select tradeable regimes FOR THE CHOSEN TICKER (top‑3 with fallback) + FLAT regime
+chosen_ticker = "AAPL"  # change here if you want a different stock
+
+# Slice to single‑ticker views
+df_one, X_one, r_one = slice_ticker(df_regime, X, regimes_gmm, ticker_col="Ticker", ticker=chosen_ticker)
+
+# Per‑ticker regime stats
+gmm_stats_one = regime_stats(df_one, r_one, price_col="Close")
+print(f"GMMHMM regime stats for {chosen_ticker} (sorted by Sharpe):\n", gmm_stats_one, "\n")
+
+#
+# Pick exactly 3 diverse, stable trade regimes for this ticker
+trade_regimes, chosen = select_trade_regimes_stable(
+    gmm_stats_one, top_k=3, sharpe_min=0.5, min_count=500, diversity_eps=0.0005
+)
+# Flat regime: smallest |mean| and low std among the rest
+flat_reg = choose_flat_regime(gmm_stats_one, exclude=trade_regimes)
+flat_regimes = [flat_reg] if flat_reg is not None else []
+print("Chosen trade regimes (per‑ticker):", trade_regimes)
+print("Flat regime (no trade):", flat_regimes)
 print(chosen, "\n")
 
-# 4c) Backtest with optional confidence filter and transaction costs
+# Choose short regimes from the lowest Sharpe ones (excluding trade + flat)
+short_regimes = choose_short_regimes(gmm_stats_one, exclude=trade_regimes + flat_regimes, k=1)
+print("Short regimes (per‑ticker):", short_regimes)
+
+# Single‑stock backtest
 bt_df, perf = backtest_regime_filter(
-    df=df_regime,
+    df=df_one,
     price_col="Close",
-    regimes=regimes_gmm,
+    regimes=r_one,
     model=gmm_model,
-    X=X,                    # SAME features (rows aligned to df_regime.index)
+    X=X_one,
     trade_regimes=trade_regimes,
-    min_prob=0.60,          # e.g., only take trades when model is ≥60% confident
-    tc_bps=2.0              # 2 bps per flip (enter/exit combined)
+    flat_regimes=flat_regimes,
+    allow_short=bool(short_regimes),
+    short_regimes=short_regimes,
+    size_by_prob=True,
+    min_prob=0.60,
+    tc_bps=2.0,
+    date_col="Date"
 )
 
 print("Performance summary:\n", pd.Series(perf))
@@ -873,19 +1057,24 @@ def _build_positions(regimes, trade_regimes, max_prob, min_prob):
     return np.where((np.isin(regimes, trade_regimes)) & (max_prob >= min_prob), 1.0, 0.0)
 
 def _trades_from_position(idx, position_shift):
-    flips = position_shift.diff().fillna(position_shift.iloc[0]).values
-    pos = position_shift.values
+    # Detect entries/exits by sign changes of the executed position (supports sized positions)
+    pos = position_shift.astype(float).values
     dates = idx
-
     trades = []
     open_i = None
+
+    prev = 0.0
     for i in range(len(pos)):
-        if flips[i] > 0 and pos[i] == 1:     # flat -> long
+        curr = pos[i]
+        # entry: move from <= 0 to > 0
+        if prev <= 0 and curr > 0 and open_i is None:
             open_i = i
-        elif flips[i] < 0 and pos[i] == 0:   # long -> flat
-            if open_i is not None:
-                trades.append((dates[open_i], dates[i], 1))
-                open_i = None
+        # exit: move from > 0 to <= 0
+        elif prev > 0 and curr <= 0 and open_i is not None:
+            trades.append((dates[open_i], dates[i], 1))
+            open_i = None
+        prev = curr
+
     if open_i is not None:
         trades.append((dates[open_i], dates[-1], 1))
     return trades
@@ -908,26 +1097,22 @@ def _per_trade_stats(df, price_col, trades, tc_bps):
         })
     return pd.DataFrame(rows)
 
-# helper to pick a single ticker while keeping arrays aligned
-def slice_ticker(df, X, regimes, ticker_col, ticker):
-    mask = (df[ticker_col] == ticker).values
-    df_s = df.loc[mask].copy()
-    X_s = X[mask] if isinstance(X, np.ndarray) else X.loc[mask].values
-    r_s = regimes[mask] if isinstance(regimes, np.ndarray) else np.asarray(regimes)[mask]
-    return df_s, X_s, r_s
-
 # %%
 # ----- main backtest + plotly figs -----
 def backtest_regime_filter_plotly(
     df, price_col, regimes, model, X, trade_regimes,
     min_prob=0.60, tc_bps=2.0, regime_alpha=0.10,
-    ticker: str | None = None,            # used in titles only
-    allow_short: bool = False,            # enable shorting
-    short_regimes: list[int] | None = None, # which regimes to short (if None, none)
-    size_by_prob: bool = False,           # size position by max posterior prob
-    marker_size: int = 12                  # make trade signals bigger
+    ticker: str | None = None,
+    allow_short: bool = False,
+    short_regimes: list[int] | None = None,
+    size_by_prob: bool = False,
+    marker_size: int = 12,
+    date_col: str = "Date",
+    flat_regimes: list[int] | None = None
 ):
     temp = df.copy()
+    if date_col in temp.columns:
+        temp = temp.set_index(date_col)
     temp["ret"] = temp[price_col].pct_change().fillna(0.0)
 
     # confidence
@@ -935,7 +1120,8 @@ def backtest_regime_filter_plotly(
 
     # build position allowing long, optional short, optional sizing
     reg = np.asarray(regimes)
-    long_mask  = np.isin(reg, trade_regimes) & (max_prob >= min_prob)
+    flat_regimes = flat_regimes or []
+    long_mask  = np.isin(reg, trade_regimes) & (~np.isin(reg, np.array(flat_regimes))) & (max_prob >= min_prob)
     short_mask = np.zeros_like(long_mask, dtype=bool)
     if allow_short and short_regimes:
         short_mask = np.isin(reg, np.array(short_regimes)) & (max_prob >= min_prob)
@@ -1019,6 +1205,20 @@ def backtest_regime_filter_plotly(
                 fig_price.add_vrect(x0=start, x1=end, fillcolor=color, line_width=0, opacity=regime_alpha, layer="below")
                 in_block = False
 
+    # shade flat regimes (no-trade) in light gray
+    for r in (flat_regimes or []):
+        mask = (r_series == r).values
+        in_block = False
+        start = None
+        for i, on in enumerate(mask):
+            if on and not in_block:
+                in_block = True; start = temp.index[i]
+            last = (i == len(mask)-1)
+            if (not on or last) and in_block:
+                end = temp.index[i] if not on else temp.index[-1]
+                fig_price.add_vrect(x0=start, x1=end, fillcolor="rgba(120,120,120,0.15)", line_width=0, layer="below")
+                in_block = False
+   
     # bigger markers + separate long/short markers
     if not trades_df.empty:
         long_entries = trades_df.loc[trades_df["side"]=="long", "entry"]
@@ -1080,15 +1280,10 @@ def backtest_regime_filter_plotly(
     return temp, trades_df, perf, fig_price, fig_equity
 
 # %%
-# choose a ticker from df_regime["Ticker"]
-chosen_ticker = "AAPL"  # <- set this
+# Reuse earlier single‑stock slice and selections
+df_t, X_t, r_t = df_one, X_one, r_one
 
-# Slice data consistently
-df_t, X_t, r_t = slice_ticker(df_regime, X, regimes_gmm, ticker_col="Ticker", ticker=chosen_ticker)
-
-# Choose regimes to long/short (you probably already picked trade_regimes earlier)
-# e.g., trade_regimes from your Sharpe ranking; optionally define short_regimes:
-short_regs = []  # e.g., [2, 5] if you want to short those
+short_regs = short_regimes
 
 bt_df, trades_df, perf, fig_price, fig_equity = backtest_regime_filter_plotly(
     df=df_t,
@@ -1096,15 +1291,17 @@ bt_df, trades_df, perf, fig_price, fig_equity = backtest_regime_filter_plotly(
     regimes=r_t,
     model=gmm_model,
     X=X_t,
-    trade_regimes=trade_regimes,      # your top regimes to go long
-    short_regimes=short_regs,         # optional shorting
-    allow_short=bool(short_regs),     # enable if you passed some
-    size_by_prob=True,                # confidence‑weighted sizing
-    min_prob=0.55,                    # confidence gate (tune 0.4–0.7)
-    tc_bps=3.0,                       # higher TC if you want
-    regime_alpha=0.14,                # slightly stronger shading
-    marker_size=14,                   # bigger markers
-    ticker=chosen_ticker              # appears in titles + perf
+    trade_regimes=trade_regimes,
+    short_regimes=short_regs,
+    allow_short=bool(short_regs),
+    size_by_prob=True,
+    min_prob=0.55,
+    tc_bps=3.0,
+    regime_alpha=0.14,
+    marker_size=14,
+    ticker=chosen_ticker,
+    date_col="Date",
+    flat_regimes=flat_regimes,
 )
 
 print("Performance summary:\n", pd.Series(perf))
@@ -1114,7 +1311,416 @@ trades_df.head()
 
 # %%
 # (cached) models & data already saved above; skip duplicate dumps
+
 print("[cache] artifacts persisted under:", CACHE_DIR)
+
+# %%
+# =============================
+# STRATEGY RUNNER: rank tickers by out-of-sample cumulative return
+# =============================
+
+from datetime import date
+
+def _download_yf(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """Download OHLCV (daily) using yfinance, standardize columns (CACHED)."""
+    key = _hash_key({"fn": "yf", "ticker": ticker, "start": start, "end": end})
+    path = cache_path("yf", key, ext="parquet")
+    if path.exists():
+        df_y = load_parquet_df(path)
+        print(f"[cache] loaded yf {ticker} {start}->{end} => {path.name}")
+        return df_y
+
+    df_y = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
+    if df_y is None or df_y.empty:
+        return pd.DataFrame(columns=["Date","Open","High","Low","Close","Volume","Ticker"])    
+    df_y = df_y.rename(columns={"Adj Close": "AdjClose"}).reset_index()
+    df_y["Ticker"] = ticker
+    df_y = df_y[["Date","Open","High","Low","Close","Volume","Ticker"]]
+
+    save_parquet_df(df_y, path)
+    print(f"[cache] saved yf {ticker} {start}->{end} => {path.name}")
+    return df_y
+
+
+def _prepare_features_single(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, list[str], StandardScaler]:
+    """Compute indicators and scaled feature matrix for a single-ticker df (CACHED).
+    Returns (df_features, X, scaled_cols, scaler).
+    """
+    if df_raw.empty:
+        return df_raw.copy(), np.empty((0, len(features_to_use))), [f"{c}_scaled" for c in features_to_use], None
+
+    ticker = str(df_raw["Ticker"].iloc[0])
+    start  = str(pd.to_datetime(df_raw["Date"].min()).date())
+    end    = str(pd.to_datetime(df_raw["Date"].max()).date())
+
+    key = _hash_key({"fn": "feats", "ticker": ticker, "start": start, "end": end, "features": features_to_use})
+    fpath = cache_path("feats", key, ext="parquet")
+    spath = cache_path("feats_scaler", key, ext="pkl")
+
+    if fpath.exists() and spath.exists():
+        df_feat = load_parquet_df(fpath)
+        scaler_local = load_pkl(spath)
+        scaled_cols_local = [f"{c}_scaled" for c in features_to_use]
+        X_local = df_feat[scaled_cols_local].values
+        print(f"[cache] loaded features => {fpath.name}")
+        return df_feat, X_local, scaled_cols_local, scaler_local
+
+    # compute features fresh
+    df_feat = add_indicators(df_raw)
+    df_feat = df_feat.dropna(subset=features_to_use).copy()
+    df_feat.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_feat = df_feat[df_feat[features_to_use].abs().lt(1e10).all(axis=1)]
+    df_feat.dropna(subset=features_to_use, inplace=True)
+
+    scaler_local = StandardScaler()
+    X_local = scaler_local.fit_transform(df_feat[features_to_use])
+    scaled_cols_local = [f"{c}_scaled" for c in features_to_use]
+    df_feat[scaled_cols_local] = X_local
+
+    save_parquet_df(df_feat, fpath)
+    save_pkl(scaler_local, spath)
+    print(f"[cache] saved features => {fpath.name}")
+
+    return df_feat, X_local, scaled_cols_local, scaler_local
+
+
+def run_ticker_walkforward_rank(
+    ticker: str,
+    lookback_days: int = 252*2,
+    eval_days: int = 63,
+    n_states: int = 6,
+    n_mix: int = 3,
+    covariance_type: str = "full",
+    tol: float = 0.01,
+    min_prob: float = 0.60,
+    tc_bps: float = 3.0,
+    allow_short: bool = True,
+    size_by_prob: bool = True,
+    use_cache: bool = True,
+    refresh: bool = False,
+) -> dict:
+    """
+    Walk-forward for a single ticker: train on the last `lookback_days`, predict/backtest next `eval_days` OOS.
+    Returns a dict with performance + metadata for ranking.
+    """
+    # Dates
+    today = pd.Timestamp(date.today())
+    start = (today - pd.Timedelta(days=lookback_days + eval_days + 5)).strftime("%Y-%m-%d")
+    split = (today - pd.Timedelta(days=eval_days)).strftime("%Y-%m-%d")
+    end   = today.strftime("%Y-%m-%d")
+
+    # Cache key for this walk-forward evaluation
+    wf_key = _hash_key({
+        "fn": "walk_oos",
+        "ticker": ticker,
+        "lookback": lookback_days,
+        "eval": eval_days,
+        "n_states": n_states,
+        "n_mix": n_mix,
+        "cov": covariance_type,
+        "tol": tol,
+        "min_prob": min_prob,
+        "tc_bps": tc_bps,
+        "allow_short": allow_short,
+        "size_by_prob": size_by_prob,
+        "features": features_to_use,
+        "start": start,
+        "split": split,
+        "end": end,
+    })
+    wf_path = cache_path("walk_oos_perf", wf_key, ext="pkl")
+
+    if use_cache and not refresh and wf_path.exists():
+        perf = load_pkl(wf_path)
+        print(f"[cache] loaded walk-forward perf {ticker} => {wf_path.name}")
+        return perf
+
+    # Download
+    df_raw = _download_yf(ticker, start=start, end=end)
+    if df_raw.empty or len(df_raw) < (lookback_days//2):
+        return {"ticker": ticker, "status": "no_data"}
+
+    # Features on full span; then split to train/test by Date
+    df_feat, X_all, scaled_cols_local, scaler_local = _prepare_features_single(df_raw)
+    df_feat = df_feat.sort_values("Date").reset_index(drop=True)
+    mask_train = df_feat["Date"] < pd.to_datetime(split)
+    mask_test  = df_feat["Date"] >= pd.to_datetime(split)
+
+    if mask_train.sum() < 100 or mask_test.sum() < 20:
+        return {"ticker": ticker, "status": "insufficient_window"}
+
+    # Train GMMHMM on train window only (OOS test)
+    X_tr = df_feat.loc[mask_train, [f"{c}_scaled" for c in features_to_use]].values
+    X_te = df_feat.loc[mask_test,  [f"{c}_scaled" for c in features_to_use]].values
+
+    model = GMMHMM(n_components=n_states, n_mix=n_mix, covariance_type=covariance_type,
+                   n_iter=1000, tol=tol, random_state=42)
+    model.fit(X_tr)
+
+    # Regime selection based on TRAIN stats
+    regimes_tr = model.predict(X_tr)
+    stats_tr = regime_stats(df_feat.loc[mask_train], regimes_tr, price_col="Close")
+    trade_regs, _ = select_trade_regimes_stable(stats_tr, top_k=3, sharpe_min=0.5, min_count=100, diversity_eps=0.0005)
+    flat_reg = choose_flat_regime(stats_tr, exclude=trade_regs)
+    flat_regs = [flat_reg] if flat_reg is not None else []
+    short_regs = choose_short_regimes(stats_tr, exclude=trade_regs + flat_regs, k=1)
+
+    # OOS backtest on TEST window
+    regimes_te = model.predict(X_te)
+    df_te = df_feat.loc[mask_test].copy()
+    bt_df, perf = backtest_regime_filter(
+        df=df_te,
+        price_col="Close",
+        regimes=regimes_te,
+        model=model,
+        X=X_te,
+        trade_regimes=trade_regs,
+        flat_regimes=flat_regs,
+        allow_short=bool(short_regs) and allow_short,
+        short_regimes=short_regs if allow_short else [],
+        size_by_prob=size_by_prob,
+        min_prob=min_prob,
+        tc_bps=tc_bps,
+        date_col="Date",
+    )
+
+    perf.update({
+        "ticker": ticker,
+        "status": "ok",
+        "lookback_days": lookback_days,
+        "eval_days": eval_days,
+        "start": start,
+        "split": split,
+        "end": end,
+    })
+    if use_cache:
+        save_pkl(perf, wf_path)
+        # also persist the OOS backtest dataframe for diagnostics
+        bt_path = cache_path("walk_oos_bt", wf_key + "-bt", ext="parquet")
+        save_parquet_df(bt_df.reset_index(), bt_path)
+        print(f"[cache] saved walk-forward perf {ticker} => {wf_path.name}")
+        print(f"[cache] saved walk-forward bt_df {ticker} => {bt_path.name}")
+    return perf
+
+
+from typing import Optional
+
+def rank_universe_topN(
+    tickers: list[str],
+    topN: int = 10,
+    lookback_days: int = 252*2,
+    eval_days: int = 63,
+    n_jobs: int = -1,
+    rank_by: str = "cum",            # "cum" or "sharpe"
+    exposure_cap: Optional[float] = None,  # e.g., 0.85 to cap exposure
+    dd_cap: Optional[float] = None,        # e.g., 0.35 to cap max drawdown
+    **kwargs
+) -> pd.DataFrame:
+    """Run the walk-forward runner for each ticker and return a ranked table.
+    Parallelized with joblib; supports optional risk guardrails and alternative ranking metric.
+    """
+    def _one(t):
+        try:
+            return run_ticker_walkforward_rank(t, lookback_days=lookback_days, eval_days=eval_days, **kwargs)
+        except Exception as e:
+            return {"ticker": t, "status": f"error: {e}"}
+
+    rows = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")(delayed(_one)(t) for t in tickers)
+    out = pd.DataFrame(rows)
+    ok = out[out["status"] == "ok"].copy()
+    if ok.empty:
+        print("[warn] No successful runs.")
+        return out
+
+    # Optional risk filters
+    if exposure_cap is not None:
+        ok = ok[ok["exposure"] <= float(exposure_cap)]
+    if dd_cap is not None:
+        ok = ok[ok["max_drawdown"] <= float(dd_cap)]
+    if ok.empty:
+        print("[warn] All runs filtered out by risk guardrails.")
+        return out
+
+    # Ranking metric
+    if rank_by == "sharpe":
+        ok = ok.sort_values(["sharpe", "final_cum_strategy"], ascending=[False, False])
+    else:
+        ok = ok.sort_values("final_cum_strategy", ascending=False)
+
+    return ok.head(topN)
+
+
+# Example runner using the tickers already in df_top100
+try:
+    universe = sorted(df_top100["Ticker"].unique().tolist())
+except Exception:
+    universe = _tickers_all  # fallback from earlier
+
+print(f"[strategy] universe size: {len(universe)}")
+
+ranked_top10 = rank_universe_topN(
+    universe,
+    topN=10,
+    lookback_days=252*2,
+    eval_days=63,
+    min_prob=0.60,
+    tc_bps=3.0,
+    allow_short=True,
+    size_by_prob=True,
+    n_jobs=-1,             # parallelize across all cores
+    rank_by="cum",        # or "sharpe"
+    # exposure_cap=0.85,   # optional risk guardrail
+    # dd_cap=0.35,         # optional risk guardrail
+)
+
+
+print("\n=== TOP 10 TICKERS BY OOS CUMULATIVE RETURN ===")
+print(ranked_top10[["ticker","final_cum_strategy","sharpe","max_drawdown","exposure"]].to_string(index=False))
+
+# persist ranked table (CSV + Parquet) with UTC timestamp key
+_ts = pd.Timestamp.utcnow().strftime("%Y%m%d-%H%M%S")
+save_parquet_df(ranked_top10, cache_path("ranked_top10", _ts, ext="parquet"))
+ranked_top10.to_csv(cache_path("ranked_top10", _ts, ext="csv"), index=False)
+
+# %%
+# =============================
+# LIVE SIGNALS for the ranked top N
+# =============================
+
+def run_ticker_live_signal(
+    ticker: str,
+    lookback_days: int = 252*2,
+    n_states: int = 6,
+    n_mix: int = 3,
+    covariance_type: str = "full",
+    tol: float = 0.01,
+    min_prob: float = 0.60,
+    allow_short: bool = True,
+    size_by_prob: bool = True,
+    use_cache: bool = True,
+    refresh: bool = False,
+    max_live_weight: float = 1.0,
+) -> dict:
+    """Fit on recent lookback window and produce today's signal for a single ticker."""
+    today = pd.Timestamp(date.today())
+    start = (today - pd.Timedelta(days=lookback_days + 5)).strftime("%Y-%m-%d")
+    end   = today.strftime("%Y-%m-%d")
+
+    # Cache key for today's live signal
+    today_str = end
+    live_key = _hash_key({
+        "fn": "live_signal",
+        "ticker": ticker,
+        "lookback": lookback_days,
+        "n_states": n_states,
+        "n_mix": n_mix,
+        "cov": covariance_type,
+        "tol": tol,
+        "min_prob": min_prob,
+        "allow_short": allow_short,
+        "size_by_prob": size_by_prob,
+        "features": features_to_use,
+        "asof": today_str,
+    })
+    live_path = cache_path("live_signal", live_key, ext="pkl")
+
+    if use_cache and not refresh and live_path.exists():
+        sig = load_pkl(live_path)
+        print(f"[cache] loaded live signal {ticker} @ {today_str} => {live_path.name}")
+        return sig
+
+    df_raw = _download_yf(ticker, start=start, end=end)
+    if df_raw.empty:
+        return {"ticker": ticker, "status": "no_data"}
+
+    df_feat, X_all, scaled_cols_local, scaler_local = _prepare_features_single(df_raw)
+    if len(df_feat) < 60:
+        return {"ticker": ticker, "status": "too_short"}
+
+    # Fit on all but the last observation to avoid trivial leakage
+    n_all = len(df_feat)
+    X_tr = X_all[:-1]
+    X_last = X_all[-1:]
+
+    model = GMMHMM(n_components=n_states, n_mix=n_mix, covariance_type=covariance_type,
+                   n_iter=1000, tol=tol, random_state=42)
+    model.fit(X_tr)
+
+    # Regime selection from TRAIN stats
+    regimes_tr = model.predict(X_tr)
+    stats_tr = regime_stats(df_feat.iloc[:-1], regimes_tr, price_col="Close")
+    trade_regs, _ = select_trade_regimes_stable(stats_tr, top_k=3, sharpe_min=0.5, min_count=100, diversity_eps=0.0005)
+    flat_reg = choose_flat_regime(stats_tr, exclude=trade_regs)
+    flat_regs = [flat_reg] if flat_reg is not None else []
+    short_regs = choose_short_regimes(stats_tr, exclude=trade_regs + flat_regs, k=1)
+
+    # Posterior for the last observation
+    post_all = model.predict_proba(X_all)
+    last_post = post_all[-1]
+    reg_last = int(np.argmax(last_post))
+    max_prob = float(last_post.max())
+
+    # Position logic
+    pos = 0.0
+    if (reg_last in trade_regs) and (reg_last not in flat_regs) and (max_prob >= min_prob):
+        pos = max_prob if size_by_prob else 1.0
+    elif allow_short and (reg_last in short_regs) and (max_prob >= min_prob):
+        pos = -max_prob if size_by_prob else -1.0
+
+    # Risk guardrail: cap live position weight
+    pos = float(np.clip(pos, -max_live_weight, max_live_weight))
+
+    asof = pd.to_datetime(df_feat["Date"].iloc[-1]).date()
+    last_close = float(df_feat["Close"].iloc[-1])
+
+    out = {
+        "ticker": ticker,
+        "status": "ok",
+        "asof": str(asof),
+        "regime": reg_last,
+        "max_prob": max_prob,
+        "position": float(pos),
+        "last_close": last_close,
+        "trade_regimes": trade_regs,
+        "flat_regimes": flat_regs,
+        "short_regimes": short_regs,
+    }
+
+    if use_cache:
+        save_pkl(out, live_path)
+        print(f"[cache] saved live signal {ticker} @ {today_str} => {live_path.name}")
+
+    return out
+
+
+def live_signals_for_topN(ranked_df: pd.DataFrame,
+                          lookback_days: int = 252*2,
+                          **kwargs) -> pd.DataFrame:
+    tickers = ranked_df["ticker"].tolist()
+    rows = []
+    for t in tickers:
+        try:
+            rows.append(run_ticker_live_signal(t, lookback_days=lookback_days, **kwargs))
+        except Exception as e:
+            rows.append({"ticker": t, "status": f"error: {e}"})
+    return pd.DataFrame(rows)
+
+live_top10 = live_signals_for_topN(
+    ranked_top10,
+    lookback_days=252*2,
+    min_prob=0.60,
+    allow_short=True,
+    size_by_prob=True,
+    # max_live_weight=0.7,  # optional cap per ticker
+)
+
+print("\n=== LIVE SIGNALS (today) FOR TOP 10 ===")
+cols = ["ticker","asof","regime","max_prob","position","last_close"]
+print(live_top10[cols + ["status"]].to_string(index=False))
+
+# persist live signals (CSV + Parquet)
+save_parquet_df(live_top10, cache_path("live_top10", _ts, ext="parquet"))
+live_top10.to_csv(cache_path("live_top10", _ts, ext="csv"), index=False)
 
 
 # %%
@@ -1126,16 +1732,7 @@ gaussian_model
 # %%
 """
 things to continue:
-
-1. fix error above
-2. implement ability to choose ticker
-3.5 build out STEP 7
-4. make the trade signals bigger. cant tell from the graph
-
-	•	Shorting in bad regimes: let position be -1 in low‑Sharpe regimes.
-	•	Position sizing: scale by posterior probability (e.g., position = max_prob within trade regimes).
-	•	Stop trading if confidence low: you already have min_prob, tune it!
-	•	Walk‑forward: fit on a rolling window and predict out‑of‑sample for tighter realism.
+- step 9
 
 heres a catch up on current thought process:
 - .venv(Python 3.11.5) is my environment and kernal
@@ -1146,7 +1743,11 @@ heres a catch up on current thought process:
 - STEP 5: create comprehensive graph going over confidence level, regimes, and trade signals 
 - STEP 6: figure out what each regime means. Regimes are hidden patterns, doesnt tell us what they are just that a pattern exists. All the regime 1 is buy, regime 5 is sell, other regimes are hold.
 - STEP 7: backtest (NEED TO DO)
-- STEP 8: download current data and figure out what regime we're currently in. 
+- STEP 8: download current data and figure out what regime we're currently in.
+- STEP 9: the actual strategy: fit model on current data and rank tickers by top 10 predicted cumulative returns
+
+
+it doesnt seem to change anything return wise. but this isnt really a strategy right now anyway. i think the best way to approach this is to take every, distinct, ticker, run the model on new, current data, and then rank the top 10 by cumulative return 
 """
 
 
