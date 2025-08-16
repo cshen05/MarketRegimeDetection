@@ -80,10 +80,13 @@ df
 df['Volume'].median()
 
 # %%
-# Filter for recent rows only (CACHED)
-cutoff_days = 45
-min_avg_volume = 427_000
-min_price = 5
+# Filter for recent rows only (CACHED) — auto‑refresh Top‑100 most liquid
+# Tunables
+cutoff_days = 45            # how fresh the liquidity window is
+min_avg_volume = 427_000    # base volume floor
+min_price = 5               # ignore penny stocks
+TOP_N = 100                 # number of liquid tickers to keep
+LIQUIDITY_METRIC = "dollar" # "dollar" (default) or "volume"
 
 cutoff = df["Date"].max() - timedelta(days=cutoff_days)
 
@@ -91,27 +94,51 @@ _top100_key = _hash_key({
     "cutoff": str(cutoff.date()),
     "min_avg_volume": min_avg_volume,
     "min_price": min_price,
+    "top_n": TOP_N,
+    "liq_metric": LIQUIDITY_METRIC,
 })
 
 summary_cache_path = cache_path("summary-recent", _top100_key, ext="parquet")
 top100_cache_path = cache_path("df_top100", _top100_key, ext="parquet")
 
-if top100_cache_path.exists():
+if top100_cache_path.exists() and summary_cache_path.exists():
     summary = load_parquet_df(summary_cache_path)
     df_top100 = load_parquet_df(top100_cache_path)
     print(f"[cache] loaded df_top100 => {top100_cache_path.name}")
 else:
-    df_recent = df[df["Date"] >= cutoff]
+    # recent slice + basic sanity filters
+    df_recent = df[df["Date"] >= cutoff].copy()
     df_recent = df_recent[(df_recent["Close"].notna()) & (df_recent["Volume"].notna())]
 
+    # compute liquidity metrics
+    df_recent["DollarVolume"] = df_recent["Close"].astype(float) * df_recent["Volume"].astype(float)
+
     summary = (
-        df_recent.groupby("Ticker").agg(LastPrice=("Close", "last"), AvgVolume=("Volume", "mean"))
+        df_recent
+        .groupby("Ticker", as_index=False)
+        .agg(
+            LastPrice=("Close", "last"),
+            AvgVolume=("Volume", "mean"),
+            AvgDollarVolume=("DollarVolume", "mean"),
+        )
     )
+
+    # baseline filters
     filtered = summary.query("AvgVolume > @min_avg_volume and LastPrice > @min_price")
-    top_tickers = filtered.nlargest(100, "AvgVolume").index.tolist()
+
+    # choose ranking metric
+    if LIQUIDITY_METRIC == "dollar":
+        order_col = "AvgDollarVolume"
+    else:
+        order_col = "AvgVolume"
+
+    top_tickers = (
+        filtered.nlargest(TOP_N, order_col)["Ticker"].tolist()
+    )
+
     df_top100 = df[df["Ticker"].isin(top_tickers)].reset_index(drop=True)
 
-    save_parquet_df(summary.reset_index(), summary_cache_path)
+    save_parquet_df(summary, summary_cache_path)
     save_parquet_df(df_top100, top100_cache_path)
     print(f"[cache] saved df_top100 => {top100_cache_path.name}")
 
@@ -940,6 +967,7 @@ def backtest_regime_filter(df, price_col, regimes, model, X, trade_regimes,
         return mean, vol, sharpe, dd
 
     ann_mean, ann_vol, ann_sharpe, max_dd = annualized_stats(temp["strat_ret"])
+    exposure = float(temp["position_shift"].abs().mean())
 
     perf = {
         "trade_regimes": trade_regimes,
@@ -952,7 +980,8 @@ def backtest_regime_filter(df, price_col, regimes, model, X, trade_regimes,
         "ann_return": ann_mean,
         "ann_vol": ann_vol,
         "sharpe": ann_sharpe,
-        "max_drawdown": max_dd
+        "max_drawdown": max_dd,
+        "exposure": exposure,
     }
 
     # Plot
@@ -1575,7 +1604,16 @@ ranked_top10 = rank_universe_topN(
 
 
 print("\n=== TOP 10 TICKERS BY OOS CUMULATIVE RETURN ===")
-print(ranked_top10[["ticker","final_cum_strategy","sharpe","max_drawdown","exposure"]].to_string(index=False))
+want_cols = ["ticker","final_cum_strategy","sharpe","max_drawdown","exposure"]
+cols_present = [c for c in want_cols if c in ranked_top10.columns]
+if len(cols_present) == len(want_cols) and not ranked_top10.empty:
+    print(ranked_top10[cols_present].to_string(index=False))
+else:
+    # Fallback: show whatever we have, or an explanatory message
+    if ranked_top10.empty:
+        print("[warn] Ranking is empty — likely no successful OOS runs. Check data availability, lookback/eval windows, or set refresh=True.")
+    else:
+        print(ranked_top10.head(20).to_string(index=False))
 
 # persist ranked table (CSV + Parquet) with UTC timestamp key
 _ts = pd.Timestamp.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -1631,11 +1669,21 @@ def run_ticker_live_signal(
 
     df_raw = _download_yf(ticker, start=start, end=end)
     if df_raw.empty:
-        return {"ticker": ticker, "status": "no_data"}
+        return {
+            "ticker": ticker, "status": "no_data", "asof": None, "regime": None,
+            "max_prob": None, "position": 0.0, "last_close": None,
+            "trade_regimes": [], "flat_regimes": [], "short_regimes": []
+        }
 
     df_feat, X_all, scaled_cols_local, scaler_local = _prepare_features_single(df_raw)
     if len(df_feat) < 60:
-        return {"ticker": ticker, "status": "too_short"}
+        last_dt = None if df_feat.empty else str(pd.to_datetime(df_feat["Date"].iloc[-1]).date())
+        last_px = None if df_feat.empty else float(df_feat["Close"].iloc[-1])
+        return {
+            "ticker": ticker, "status": "too_short", "asof": last_dt, "regime": None,
+            "max_prob": None, "position": 0.0, "last_close": last_px,
+            "trade_regimes": [], "flat_regimes": [], "short_regimes": []
+        }
 
     # Fit on all but the last observation to avoid trivial leakage
     n_all = len(df_feat)
@@ -1703,7 +1751,14 @@ def live_signals_for_topN(ranked_df: pd.DataFrame,
             rows.append(run_ticker_live_signal(t, lookback_days=lookback_days, **kwargs))
         except Exception as e:
             rows.append({"ticker": t, "status": f"error: {e}"})
-    return pd.DataFrame(rows)
+    df_out = pd.DataFrame(rows)
+    # ensure columns exist for safe printing downstream
+    ensure_cols = ["ticker","status","asof","regime","max_prob","position","last_close",
+                   "trade_regimes","flat_regimes","short_regimes"]
+    for c in ensure_cols:
+        if c not in df_out.columns:
+            df_out[c] = np.nan if c not in ("trade_regimes","flat_regimes","short_regimes","position") else ([] if c != "position" else 0.0)
+    return df_out
 
 live_top10 = live_signals_for_topN(
     ranked_top10,
@@ -1715,8 +1770,12 @@ live_top10 = live_signals_for_topN(
 )
 
 print("\n=== LIVE SIGNALS (today) FOR TOP 10 ===")
-cols = ["ticker","asof","regime","max_prob","position","last_close"]
-print(live_top10[cols + ["status"]].to_string(index=False))
+want_cols_live = ["ticker","asof","regime","max_prob","position","last_close","status"]
+cols_present_live = [c for c in want_cols_live if c in live_top10.columns]
+if not live_top10.empty and len(cols_present_live) >= 2:
+    print(live_top10[cols_present_live].to_string(index=False))
+else:
+    print("[warn] No live signals available — check previous errors or set refresh=True.")
 
 # persist live signals (CSV + Parquet)
 save_parquet_df(live_top10, cache_path("live_top10", _ts, ext="parquet"))
