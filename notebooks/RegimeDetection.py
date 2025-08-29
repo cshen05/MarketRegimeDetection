@@ -22,7 +22,13 @@ import joblib
 from joblib import Parallel, delayed
 
 
+
 warnings.filterwarnings('ignore')
+
+# --- DEBUG / INSPECTION SWITCHES ---
+INSPECT_YF: bool = True           # set False to disable preview
+INSPECT_TICKER: str = "AAPL"      # which ticker's raw yf data to show
+INSPECT_ROWS: int = 12            # how many rows to print in the preview
 
 # %% [markdown]
 # CACHING HELPERS
@@ -1350,24 +1356,131 @@ print("[cache] artifacts persisted under:", CACHE_DIR)
 
 from datetime import date
 
+# --- Yahoo Finance ticker normalization & validation (cached) ---
+_yf_sym_map_path = cache_path("yf_symbol_map", "v1", ext="pkl")
+try:
+    _YF_SYM_MAP = load_pkl(_yf_sym_map_path)
+except Exception:
+    _YF_SYM_MAP = {}
+
+# common cleanups and alternates for class shares etc.
+def _normalize_symbol(t: str) -> list[str]:
+    t0 = (t or "").strip().upper()
+    # replace unicode dashes with ASCII '-'
+    t0 = t0.replace("–", "-").replace("—", "-")
+    cands = [t0]
+    # dot/hyphen alternates (e.g., BRK-B vs BRK.B)
+    if "-" in t0:
+        cands.append(t0.replace("-", "."))
+    if "." in t0:
+        cands.append(t0.replace(".", "-"))
+    # specific known aliases
+    aliases = {
+        "BRK-B": ["BRK-B", "BRK.B"],
+        "BF-B":  ["BF-B",  "BF.B"],
+    }
+    if t0 in aliases:
+        cands = aliases[t0] + cands
+    # de-dup while preserving order
+    seen, out = set(), []
+    for s in cands:
+        if s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+def _validate_yf_symbol(t: str) -> str | None:
+    """Return a yahoo-compatible symbol for `t` by trying candidates; cache successes."""
+    if t in _YF_SYM_MAP:
+        return _YF_SYM_MAP[t]
+    for cand in _normalize_symbol(t):
+        try:
+            df_try = yf.download(cand, period="3mo", progress=False, auto_adjust=False, group_by="column")
+            if df_try is not None and len(df_try) > 0:
+                _YF_SYM_MAP[t] = cand
+                save_pkl(_YF_SYM_MAP, _yf_sym_map_path)
+                return cand
+        except Exception:
+            continue
+    _YF_SYM_MAP[t] = None
+    save_pkl(_YF_SYM_MAP, _yf_sym_map_path)
+    return None
+
 def _download_yf(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """Download OHLCV (daily) using yfinance, standardize columns (CACHED)."""
-    key = _hash_key({"fn": "yf", "ticker": ticker, "start": start, "end": end})
+    """Download OHLCV (daily) using yfinance, standardize columns (CACHED).
+       If INSPECT_YF and ticker==INSPECT_TICKER, print a compact preview and write a small CSV sample.
+    """
+    # choose a yahoo-compatible fetch symbol (cached); fall back to original
+    yf_sym = _validate_yf_symbol(ticker) or ticker
+    key = _hash_key({"fn": "yf", "ticker": yf_sym, "start": start, "end": end})
     path = cache_path("yf", key, ext="parquet")
+
+    def _preview(df_y: pd.DataFrame):
+        if not ("INSPECT_YF" in globals() and INSPECT_YF) or ticker != INSPECT_TICKER:
+            return
+        if df_y is None or df_y.empty:
+            print(f"[yf] {ticker} {start}->{end}: no data to preview")
+            return
+        n = min(int(INSPECT_ROWS) if "INSPECT_ROWS" in globals() else 12, len(df_y))
+        print(f"\n[yf] PREVIEW — {ticker} {start}→{end}  rows={len(df_y)}  range=({df_y['Date'].min().date()} → {df_y['Date'].max().date()})")
+        print(df_y.head(n).to_string(index=False))
+        # save a small sample CSV for quick inspection
+        try:
+            samp_path = cache_path("yf_sample", f"{ticker}-{key}", ext="csv")
+            df_y.head(200).to_csv(samp_path, index=False)
+            print(f"[yf] wrote sample CSV => {samp_path.name}")
+        except Exception as e:
+            print(f"[yf] sample write failed: {e}")
+
     if path.exists():
         df_y = load_parquet_df(path)
-        print(f"[cache] loaded yf {ticker} {start}->{end} => {path.name}")
+        print(f"[cache] loaded yf {ticker} (fetch {yf_sym}) {start}->{end} => {path.name}")
+        _preview(df_y)
         return df_y
 
-    df_y = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
+    df_y = yf.download(
+        yf_sym,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
+    )
     if df_y is None or df_y.empty:
         return pd.DataFrame(columns=["Date","Open","High","Low","Close","Volume","Ticker"])    
-    df_y = df_y.rename(columns={"Adj Close": "AdjClose"}).reset_index()
-    df_y["Ticker"] = ticker
+
+    # --- Normalize columns to single level OHLCV ---
+    if isinstance(df_y.columns, pd.MultiIndex):
+        # Case A: (field, ticker) — drop ticker level
+        if df_y.columns.nlevels >= 2:
+            try:
+                df_y.columns = df_y.columns.droplevel(list(range(1, df_y.columns.nlevels)))
+            except Exception:
+                # fallback: pick the first symbol level via xs
+                try:
+                    sym_level = df_y.columns.get_level_values(-1).unique()[0]
+                    df_y = df_y.xs(sym_level, axis=1, level=-1)
+                except Exception:
+                    # final fallback: join levels
+                    df_y.columns = ["_".join([str(p) for p in tup if p is not None]) for tup in df_y.columns]
+        else:
+            df_y.columns = [str(c) for c in df_y.columns]
+    else:
+        df_y.columns = [str(c) for c in df_y.columns]
+
+    # Standard names and index → column
+    if "Adj Close" in df_y.columns:
+        df_y = df_y.rename(columns={"Adj Close": "AdjClose"})
+    if "Date" not in df_y.columns and isinstance(df_y.index, pd.DatetimeIndex):
+        df_y = df_y.reset_index().rename(columns={df_y.index.name or "index": "Date"})
+    else:
+        df_y = df_y.reset_index().rename(columns={df_y.index.name or "index": "Date"})
+
+    df_y["Ticker"] = ticker  # keep original label in the pipeline
     df_y = df_y[["Date","Open","High","Low","Close","Volume","Ticker"]]
 
     save_parquet_df(df_y, path)
-    print(f"[cache] saved yf {ticker} {start}->{end} => {path.name}")
+    print(f"[cache] saved yf {ticker} (fetch {yf_sym}) {start}->{end} => {path.name}")
+    _preview(df_y)
     return df_y
 
 
@@ -1377,6 +1490,17 @@ def _prepare_features_single(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, np.nda
     """
     if df_raw.empty:
         return df_raw.copy(), np.empty((0, len(features_to_use))), [f"{c}_scaled" for c in features_to_use], None
+
+    # Ensure Date column exists (some yfinance frames carry datetime index)
+    if "Date" not in df_raw.columns:
+        if isinstance(df_raw.index, pd.DatetimeIndex):
+            df_raw = df_raw.reset_index().rename(columns={df_raw.index.name or "index": "Date"})
+        else:
+            raise KeyError("Date")
+    # Ensure Ticker column exists
+    if "Ticker" not in df_raw.columns:
+        df_raw = df_raw.copy()
+        df_raw["Ticker"] = ticker if "ticker" in locals() else (str(df_raw.get("symbol", "")) or "UNKNOWN")
 
     ticker = str(df_raw["Ticker"].iloc[0])
     start  = str(pd.to_datetime(df_raw["Date"].min()).date())
@@ -1405,6 +1529,12 @@ def _prepare_features_single(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, np.nda
     X_local = scaler_local.fit_transform(df_feat[features_to_use])
     scaled_cols_local = [f"{c}_scaled" for c in features_to_use]
     df_feat[scaled_cols_local] = X_local
+
+    # Final sanity: keep Date/Ticker columns for downstream grouping/splitting
+    if "Date" not in df_feat.columns and isinstance(df_feat.index, pd.DatetimeIndex):
+        df_feat = df_feat.reset_index().rename(columns={df_feat.index.name or "index": "Date"})
+    if "Ticker" not in df_feat.columns:
+        df_feat["Ticker"] = ticker
 
     save_parquet_df(df_feat, fpath)
     save_pkl(scaler_local, spath)
@@ -1471,7 +1601,14 @@ def run_ticker_walkforward_rank(
 
     # Features on full span; then split to train/test by Date
     df_feat, X_all, scaled_cols_local, scaler_local = _prepare_features_single(df_raw)
+    if "Ticker" not in df_feat.columns:
+        df_feat["Ticker"] = ticker
     df_feat = df_feat.sort_values("Date").reset_index(drop=True)
+    if "Date" not in df_feat.columns:
+        if isinstance(df_feat.index, pd.DatetimeIndex):
+            df_feat = df_feat.reset_index().rename(columns={df_feat.index.name or "index": "Date"})
+        else:
+            raise KeyError("Date")
     mask_train = df_feat["Date"] < pd.to_datetime(split)
     mask_test  = df_feat["Date"] >= pd.to_datetime(split)
 
@@ -1534,6 +1671,48 @@ def run_ticker_walkforward_rank(
 
 from typing import Optional
 
+# --- Preflight: validate universe against Yahoo, report remaps, and drop no‑data tickers ---
+from collections import defaultdict
+
+def preflight_validate_universe(tickers: list[str], probe_period: str = "6mo"):
+    """Return (clean_universe, report_df).
+    - Tries to map each symbol to a Yahoo‑compatible code via _validate_yf_symbol (cached).
+    - Probes availability with a lightweight yf.download(period=probe_period).
+    - Builds a small report showing remaps and availability.
+    """
+    rows = []
+    for t in tickers:
+        yf_sym = _validate_yf_symbol(t) or t
+        ok = False
+        err = None
+        try:
+            df_probe = yf.download(
+                yf_sym, period=probe_period, progress=False, auto_adjust=False, group_by="column"
+            )
+            ok = (df_probe is not None) and (len(df_probe) > 0)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        rows.append({
+            "ticker": t,
+            "yf_fetch": yf_sym,
+            "ok": bool(ok),
+            "error": err,
+        })
+    rep = pd.DataFrame(rows)
+
+    # Summary prints
+    n_all = len(rep)
+    n_ok = int(rep["ok"].sum())
+    n_bad = n_all - n_ok
+    remaps = rep[rep["ticker"] != rep["yf_fetch"]]
+    if not remaps.empty:
+        print("[preflight] remapped tickers (original → yahoo):")
+        print(remaps[["ticker","yf_fetch"]].to_string(index=False))
+    print(f"[preflight] total={n_all}  ok={n_ok}  no_data_or_error={n_bad}")
+
+    clean = rep.loc[rep["ok"], "ticker"].tolist()
+    return clean, rep
+
 def rank_universe_topN(
     tickers: list[str],
     topN: int = 10,
@@ -1552,7 +1731,7 @@ def rank_universe_topN(
         try:
             return run_ticker_walkforward_rank(t, lookback_days=lookback_days, eval_days=eval_days, **kwargs)
         except Exception as e:
-            return {"ticker": t, "status": f"error: {e}"}
+            return {"ticker": t, "status": f"error: {type(e).__name__}: {e}"}
 
     rows = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")(delayed(_one)(t) for t in tickers)
     out = pd.DataFrame(rows)
@@ -1585,10 +1764,14 @@ try:
 except Exception:
     universe = _tickers_all  # fallback from earlier
 
-print(f"[strategy] universe size: {len(universe)}")
+print(f"[strategy] universe size (raw): {len(universe)}")
+
+# Preflight: drop tickers that yfinance can’t serve and show any remaps
+universe_clean, universe_report = preflight_validate_universe(universe, probe_period="6mo")
+print(f"[strategy] universe size (after preflight): {len(universe_clean)}")
 
 ranked_top10 = rank_universe_topN(
-    universe,
+    universe_clean,
     topN=10,
     lookback_days=252*2,
     eval_days=63,
@@ -1619,6 +1802,14 @@ else:
 _ts = pd.Timestamp.utcnow().strftime("%Y%m%d-%H%M%S")
 save_parquet_df(ranked_top10, cache_path("ranked_top10", _ts, ext="parquet"))
 ranked_top10.to_csv(cache_path("ranked_top10", _ts, ext="csv"), index=False)
+
+# also persist the preflight report for debugging
+try:
+    save_parquet_df(universe_report, cache_path("universe_preflight", _ts, ext="parquet"))
+    universe_report.to_csv(cache_path("universe_preflight", _ts, ext="csv"), index=False)
+    print("[cache] saved universe preflight report")
+except Exception:
+    pass
 
 # %%
 # =============================
@@ -1750,14 +1941,19 @@ def live_signals_for_topN(ranked_df: pd.DataFrame,
         try:
             rows.append(run_ticker_live_signal(t, lookback_days=lookback_days, **kwargs))
         except Exception as e:
-            rows.append({"ticker": t, "status": f"error: {e}"})
+            rows.append({"ticker": t, "status": f"error: {type(e).__name__}: {e}"})
     df_out = pd.DataFrame(rows)
     # ensure columns exist for safe printing downstream
     ensure_cols = ["ticker","status","asof","regime","max_prob","position","last_close",
                    "trade_regimes","flat_regimes","short_regimes"]
     for c in ensure_cols:
         if c not in df_out.columns:
-            df_out[c] = np.nan if c not in ("trade_regimes","flat_regimes","short_regimes","position") else ([] if c != "position" else 0.0)
+            if c in ("trade_regimes","flat_regimes","short_regimes"):
+                df_out[c] = [list() for _ in range(len(df_out))]  # one empty list per row
+            elif c == "position":
+                df_out[c] = 0.0
+            else:
+                df_out[c] = np.nan
     return df_out
 
 live_top10 = live_signals_for_topN(
